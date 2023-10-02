@@ -1,103 +1,19 @@
 #include <GL/glew.h>
-
 #include <Windows.h>
-#include <iostream>
 
-#include <MinHook.h>
-#include <stack>
-#include <atomic>
-#include <unordered_set>
+#include <iostream>
 #include <unordered_map>
 #include <thread>
+#include <atomic>
 
-#include "Shader.h"
+#include <MinHook.h>
+
 #include "Texture.h"
-#include "FrameBuffer.h"
 
-std::string gDrawTexShaderVs = R"(
-	#version 330
-
-	layout(location=0) in vec2 inPos;
-	layout(location=1) in vec2 inTexCoords;
-	
-	out vec2 o_texCoords;
-
-	void main()
-	{
-		o_texCoords = inPos;
-		gl_Position = vec4(inPos, 0.0, 1.0);
-	}	
-)";
-
-std::string  gDrawTexShaderFs = R"(
-	#version 330
-
-	in vec2 o_texCoords;
-
-	out vec4 o_OutCol;
-
-	uniform sampler2D texInput;
-
-	void main()
-	{
-		o_OutCol = texture(texInput, o_texCoords);
-	}	
-
-)";
-
-bool bInitialized = false;
-
-HDC gAppDC;
-HGLRC gHackGlCtx = 0;
-HGLRC gGameGlCtx = 0;
-
-GLuint gBridgeFBO = 0;
-GLuint gBridgeFBOTex = 0;
-const unsigned char* gBridgeFBOData = nullptr;
-
-GLuint gFullScrVAO;
-
-GLuint gDrawTexShader = 0;
-
-std::unordered_set<std::string> foundUniforms;
-std::atomic_bool gbTesting;
-std::unordered_set<std::string>::iterator gCurrentUniform;
-
-int (GLAPIENTRY* oglGetUniformLocation)(GLuint, const GLchar*);
-GLint GLAPIENTRY hglGetUniformLocation(GLuint program, const GLchar* name) {
-
-	if(gbTesting == true)
-		return oglGetUniformLocation(program, name);
-
-	// At this point we are not testing, lets keep taking samples
-
-	if (foundUniforms.count(name) < 1)
-	{
-		//printf("%d:%s\n", program, name);
-
-		foundUniforms.insert(name);
-	}
-
-	return oglGetUniformLocation(program, name);
-}
-
-bool BindedShaderHasUniform(const std::string& uniform)
-{
-	GLint currProgram;
-	glGetIntegerv(GL_CURRENT_PROGRAM, &currProgram);
-
-	GLint id = -1;
-
-	if (oglGetUniformLocation) id = oglGetUniformLocation(currProgram, uniform.c_str());
-	else id = glGetUniformLocation(currProgram, uniform.c_str());
-
-	return id != -1;
-}
-
-std::unordered_map<std::string, ChamsInfo> uniformsWallhack{
-	{"_Cutoff", {{0, 255, 255, 0}, {0, 255, 0, 0}}},
-	{"_LightColor0", {{0, 139, 139, 0}, {255, 139, 0, 0}}}
-};
+// This part is subject 
+// to change from gram to game
+// if you dont see the chams showing
+// you may try with game specific uniforms names
 
 void (WINAPI* oglDrawElements)(GLenum mode, GLsizei count, GLenum type, const void* indices);
 
@@ -106,30 +22,35 @@ GLuint gTexRed;
 GLuint gTexYellow;
 GLuint gTexPurple;
 
-GLuint* gTexAlwaysOnTop = &gTexCyan;
-GLuint* gTexJustVisible = &gTexPurple;
+std::unordered_map<std::string, ChamsInfo> gChamsDescs{
+	{"_Cutoff"		, {&gTexCyan, &gTexPurple}},	// For Trees.
+	{"_LightColor0"	, {&gTexCyan, &gTexYellow}}		// For Entities
+};
 
-void InitChamsTextures()
+std::atomic_bool gbRunning = true;
+
+bool CurrentShaderHasUniform(const std::string& uniform)
 {
-	GLTexture2DBindRestore guard(0);
+	GLint currProgram;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &currProgram);
 
-	ColorToTexture({ 0		,0xFF	,0xFF	,0xFF }, &gTexCyan);
-	ColorToTexture({ 0xFF	,0x0	,0x0	,0xFF }, &gTexRed);
-	ColorToTexture({ 0xFF	,0xFF	,0x0	,0xFF }, &gTexYellow);
-	ColorToTexture({ 0xCF	,0x34	,0x76	,0xFF }, &gTexPurple);
+	GLint id = -1;
+
+	id = glGetUniformLocation(currProgram, uniform.c_str());
+
+	return id != -1;
 }
 
-
-void DrawVisible(GLenum mode, GLsizei count, GLenum type, const void* indices)
+void DrawVisible(GLenum mode, GLsizei count, GLenum type, const void* indices, const ChamsInfo& chamsDesc)
 {
-	GLTexture2DBindRestore guard(*gTexJustVisible);
+	GLTexture2DBindRestore guard(*(chamsDesc.pVisibleChamsTex));
 
 	oglDrawElements(mode, count, type, indices);
 }
 
-void DrawAlwaysTop(GLenum mode, GLsizei count, GLenum type, const void* indices)
+void DrawAlwaysTop(GLenum mode, GLsizei count, GLenum type, const void* indices, const ChamsInfo& chamsDesc)
 {
-	GLTexture2DBindRestore guard(*gTexAlwaysOnTop);
+	GLTexture2DBindRestore guard(*(chamsDesc.pAlwaysTopChams));
 
 	glDisable(GL_DEPTH_TEST);
 
@@ -138,272 +59,150 @@ void DrawAlwaysTop(GLenum mode, GLsizei count, GLenum type, const void* indices)
 	glEnable(GL_DEPTH_TEST);
 }
 
-void InitializeFBOAndTexs()
+bool ChamsContextInitialize()
 {
-	static bool bInited = false;
+	// At this point, glew started without any problems
 
-	if (bInited)
-		return;
+	{
+		GLTexture2DBindRestore guard(0);
 
-	GLint viewPort[4];
+		ColorToTexture({ 0		,0xFF	,0xFF	,0xFF }, &gTexCyan);
+		ColorToTexture({ 0xFF	,0x0	,0x0	,0xFF }, &gTexRed);
+		ColorToTexture({ 0xFF	,0xFF	,0x0	,0xFF }, &gTexYellow);
+		ColorToTexture({ 0xCF	,0x34	,0x76	,0xFF }, &gTexPurple);
+	}
 
-	glGetIntegerv(GL_VIEWPORT, viewPort);
+	// At this point, we have the right context, for our chams
 
-	gGameGlCtx = wglGetCurrentContext();
+	return true;
+}
 
-	printf("Game: %d\n", gGameGlCtx);
-	printf("Hack: %d\n", gHackGlCtx);
+void ChamsContextShutdown(bool bUnhookElems = true)
+{
+	// To Unhook the glDrawElements func
+	if(bUnhookElems) MH_DisableHook(glDrawElements);
 
-	wglMakeCurrent(gAppDC, gGameGlCtx);
-
-	gBridgeFBO = CreateFrameBuffer(viewPort[2], viewPort[3], 4, gBridgeFBOTex);
-	InitChamsTextures();
-
-	printf("%d\n", std::this_thread::get_id());
-
-	bInited = true;
+	gbRunning = false;
 }
 
 void WINAPI hglDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
 
-	if (!bInitialized)
-		return oglDrawElements(mode, count, type, indices);
+	static bool bGlewInitialized = false;
 
-	if (mode != GL_TRIANGLES || count < 1000) return oglDrawElements(mode, count, type, indices);
-
-#ifdef TESTING
-	if (!gbTesting && GetAsyncKeyState(VK_SPACE) & 1)
+	if (!bGlewInitialized)
 	{
-		// At this point, we want to start testing
+		// At this point, there is a current app context binded
+		// Meaning we can use it to call glewInit(), all we care 
+		// is for the glProcs
 
-		gbTesting = true;
-		gCurrentUniform = foundUniforms.begin();
-	}
-
-	if (gbTesting && GetAsyncKeyState(VK_SPACE) & 1)
-	{
-		// At this point, we want to go to the next uniform
-
-		gCurrentUniform++;
-
-		printf("Selected Uniform: %s\n", (*gCurrentUniform).c_str());
-	}
-
-	if (!gbTesting) return;
-	if (BindedShaderHasUniform(*gCurrentUniform) == false) return;
-#else
-	std::pair<std::string, ChamsInfo> foundKv;
-	bool bFound = false;
-
-	for (const auto& kv : uniformsWallhack)
-	{
-		if (BindedShaderHasUniform(kv.first) == true) {
-			foundKv = kv;
-			bFound = true;
-			break;
-		}
-	}
-
-	if (!bFound) return oglDrawElements(mode, count, type, indices);
-
-	// At this point, we found a given uniformid
-	// Lets proceed with the customization
-	
-#endif
-
-	//oglDrawElements(mode, count, type, indices);
-
-	// At this point, lets just render our stuff
-	// in our own FBO, so we can use the texture
-	// to render in our context =)
-
-	InitializeFBOAndTexs();
-
-	/*{
-		GLFrameBufferBindRestore bridge(gBridgeFBO);
-
-		DrawAlwaysTop(mode, count, type, indices);
-		DrawVisible(mode, count, type, indices);
-	}*/
-
-	DrawAlwaysTop(mode, count, type, indices);
-	DrawVisible(mode, count, type, indices);
-}
-
-std::stack<void*> gToUnloadFuncs;
-std::atomic_bool gbRunning = true;
-
-void (GLAPIENTRY*oglShaderSource)(GLuint shader,
-	GLsizei count,
-	const GLchar** string,
-	const GLint* length);
-
-void GLAPIENTRY hglShaderSource(GLuint shader, GLuint count,
-	const GLchar** string,
-	const GLint* length)
-{
-	printf("%s\n", *string);
-
-	oglShaderSource(shader, count, string, length);
-}
-
-bool InitializeFullScreenVAO()
-{
-	float fullScreenQuad[] = {
-		// Positions       // Texture Coords
-		-1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
-		 1.0f, -1.0f, 0.0f, 1.0f, 0.0f,
-		-1.0f,  1.0f, 0.0f, 0.0f, 1.0f,
-
-		-1.0f,  1.0f, 0.0f, 0.0f, 1.0f,
-		 1.0f, -1.0f, 0.0f, 1.0f, 0.0f,
-		 1.0f,  1.0f, 0.0f, 1.0f, 1.0f
-	};
-
-	GLuint gFullScrVBO = 0;
-
-	glGenVertexArrays(1, &gFullScrVAO);
-	glGenBuffers(1, &gFullScrVBO);
-	glBindVertexArray(gFullScrVAO);
-	glBindBuffer(GL_ARRAY_BUFFER, gFullScrVBO);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(fullScreenQuad), fullScreenQuad, GL_STATIC_DRAW);
-	glEnableVertexAttribArray(0);
-	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-	glEnableVertexAttribArray(1);
-	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
-
-	return true;
-}
-
-bool Initialize(HDC hdc, HGLRC& outContext, HGLRC& prevCtx)
-{
-	gAppDC = hdc;
-
-	outContext = wglCreateContext(hdc);
-
-	wglMakeCurrent(hdc, outContext);
-
-	if (glewInit() != GLEW_OK)
-	{
-		printf("Failed Initializing Glew\n");
-		return false;
-	}
-
-	if ((gDrawTexShader = CompileShaders(gDrawTexShaderVs.c_str(), gDrawTexShaderFs.c_str())) == 0)
-		return false;
-
-	if (InitializeFullScreenVAO() == false)
-		return false;
-
-#ifdef TESTING
-	/*MH_CreateHook((LPVOID)glShaderSource, hglShaderSource, (LPVOID*)&oglShaderSource);
-	MH_EnableHook(glShaderSource);
-	gToUnloadFuncs.push_back(glShaderSource);*/
-
-	MH_CreateHook((LPVOID)glGetUniformLocation, hglGetUniformLocation, (LPVOID*)&oglGetUniformLocation);
-	MH_EnableHook(glGetUniformLocation);
-	gToUnloadFuncs.push(glGetUniformLocation);
-#endif
-
-	return true;
-}
-
-void* wglSwapBuffers;
-BOOL(WINAPI* owglSwapBuffers)(HDC hdc);
-
-BOOL WINAPI hwglSwapBuffers(HDC hdc)
-{
-	if(!gbRunning) return owglSwapBuffers(hdc);
-
-	HGLRC prevCtx = wglGetCurrentContext();
-
-	if(!bInitialized) 
-		gbRunning = bInitialized = Initialize(hdc, gHackGlCtx, prevCtx);
-
-	wglMakeCurrent(hdc, gHackGlCtx);
-
-	if(gBridgeFBOTex) {
-		static bool bSharedGameCtx = false;
-		static GLuint dummyColorTex = 0;
-
-		if (!bSharedGameCtx)
+		if (glewInit() != GLEW_OK)
 		{
-			GLTexture2DBindRestore guard(0);
+			printf("Failed Initializing Glew\n");
 
-			ColorToTexture({255, 0, 0, 255}, &dummyColorTex);
+			glDrawElements(mode, count, type, indices);
 
-			printf("Previous: %d\n", prevCtx);
-			printf("Game(WGL): %d\n", gGameGlCtx);
-			printf("Hack(WGL): %d\n", gHackGlCtx);
-			
-			wglMakeCurrent(NULL, NULL);
+			ChamsContextShutdown();
 
-			//bool bSucessesShare = wglShareLists(gGameGlCtx, gHackGlCtx);
-
-			//printf("%s\n", bSucessesShare ? "Sucessfully Sharing Context" : "Failed Sharing Context");
-			//printf("%d\n", GetLastError()); // (5) ERROR_ACCESS_DENIED
-			//printf("%d\n", std::this_thread::get_id());
-
-			wglMakeCurrent(hdc, gHackGlCtx);
-
-			bSharedGameCtx = true;
+			return;
 		}
 
-		glUseProgram(gDrawTexShader);
-		glActiveTexture(GL_TEXTURE0);
+		// At this point, Glew initilized Properly
 
-		//GLTexture2DBindRestore guard(gTexCyan); // gBridgeFBOTex
-
-		//// At this point the texture binded the 
-		//// rendered Stuff from the game context
-
-		//glUniform1i(glGetUniformLocation(gDrawTexShader, "texInput"), 0);
-
-		//// At this point, the shader, 
-		//// have the texture binded
-
-		//glBindVertexArray(gFullScrVAO);
-		//glDrawArrays(GL_TRIANGLES, 0, 6);
+		bGlewInitialized = true;
 	}
 
-	wglMakeCurrent(hdc, prevCtx);
+	// At this point, there are, available glProcs
 
-	auto result = owglSwapBuffers(hdc);;
+	if ((GetAsyncKeyState(VK_DELETE) & 1) == 1)
+	{
+		// At this point, user has requested to unload
+		// Lets do this call
+		
+		oglDrawElements(mode, count, type, indices);
 
-	return result;
+		ChamsContextShutdown();
+
+		return;
+	}
+
+	if (mode != GL_TRIANGLES || count < 900)
+	{
+		// Seems this draw call is to small 
+		// to be a entity, say like a player
+		// lets ignore it.
+
+		return oglDrawElements(mode, count, type, indices);
+	}
+
+	const std::pair<const std::string, ChamsInfo>* pChamDescKv = nullptr;
+
+	for (const auto& chamDescKv : gChamsDescs)
+	{
+		if (!CurrentShaderHasUniform(chamDescKv.first)) continue;
+
+		// At this point, we found a draw-call that is suitable as a "Chams Target".
+
+		pChamDescKv = &chamDescKv;
+		break;
+	}
+
+	if (pChamDescKv == nullptr)
+	{
+		// Seems we are not interested into, 
+		// tweaking this draw-call, lets pass
+
+		return oglDrawElements(mode, count, type, indices);
+	}
+
+	// At this point, we found the right 
+	// thing we want to tweak on.
+	// now, since we konw the right game context is bound, 
+	// lets deal with chams context initializetion here
+
+	static bool gbChamsCtxInitialized = false;
+
+	if (!gbChamsCtxInitialized &&
+		!(gbChamsCtxInitialized = ChamsContextInitialize()))
+	{
+		// At this point, seems we failed
+		// to initilize Chams Context
+		// Lets simply unhook and signal 
+		// the main thread to unload
+
+		oglDrawElements(mode, count, type, indices);
+
+		ChamsContextShutdown();
+
+		return;
+	}
+
+	// At this point, if first time, being here measn, we was sucessfully to initialize
+	// otherwise, means we alredy initilized, and here we are running!
+
+	DrawAlwaysTop(mode, count, type, indices, pChamDescKv->second);
+	DrawVisible(mode, count, type, indices, pChamDescKv->second);
 }
 
 bool Run()
 {
-	HMODULE ogl = LoadLibrary("OPENGL32.DLL");
-
-	if (!ogl)
-		return false;
-
-	wglSwapBuffers = (void*) GetProcAddress(ogl, "wglSwapBuffers");
-
 	if (MH_Initialize() != MH_OK)
 		return false;
 
-	MH_CreateHook((LPVOID)wglSwapBuffers, hwglSwapBuffers, (LPVOID*) & owglSwapBuffers);
-	MH_EnableHook(wglSwapBuffers);
-	gToUnloadFuncs.push(wglSwapBuffers);
-
 	MH_CreateHook((LPVOID)glDrawElements, hglDrawElements, (LPVOID*)&oglDrawElements);
 	MH_EnableHook(glDrawElements);
-	gToUnloadFuncs.push(glDrawElements);
 
 	while (gbRunning)
 	{
-		gbRunning = (GetAsyncKeyState(VK_DELETE) & 1) == 0;
-		Sleep(200);
+		// Lets periodicly check 
+		// if we are signaled to unload
+
+		Sleep(1000);
 	}
 
-	while (gToUnloadFuncs.empty() == false)
-	{
-		void* proc = gToUnloadFuncs.top(); gToUnloadFuncs.pop();
-		MH_DisableHook(proc);
-	}
+	// The glDrawElements hook, is spected to unload itself, 
+	// before signaling this thread to finish by setting 
+	// the gbRunning flag, meaning that at this point, 
+	// we are guaranteed to unload
 
 	MH_Uninitialize();
 
@@ -412,14 +211,29 @@ bool Run()
 
 void WINAPI Start(HMODULE hMod)
 {
-	AllocConsole();
-	FILE* f;
-	freopen_s(&f, "CONOUT$", "w", stdout);
+	bool result = 1;
 
-	bool result = Run();
+	if (AllocConsole())
+	{
+		// At this point, we sucessfully created the console
 
-	fclose(f);
-	FreeConsole();
+		FILE* f;
+		freopen_s(&f, "CONOUT$", "w", stdout);
+
+		// At this point, we sucessfully 
+		// reopened stdout ( 
+		// now we can write to stdout of this console 
+		// )
+
+		result = Run();
+
+		// At this point, our module, finilized Running!
+
+		fclose(f);
+		FreeConsole();
+	}
+
+	// Now Lets unload everything!
 
 	FreeLibraryAndExitThread(hMod, result);
 }

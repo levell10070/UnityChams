@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.12)
 project(ShaderDumper)
 
-add_library(ShaderDumper SHARED dllmain.cpp "Shader.cpp" "Texture.cpp" "Vectors.h" "FrameBuffer.cpp")
+add_library(ShaderDumper SHARED dllmain.cpp  "Texture.cpp" "Vectors.h" )
 
 find_package(OpenGL REQUIRED)
 

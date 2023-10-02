@@ -16,6 +16,6 @@ struct Vec4 {
 };
 
 struct ChamsInfo {
-	Vec4 visibleChams;
-	Vec4 alwaysTopChams;
+	GLuint* pVisibleChamsTex;
+	GLuint* pAlwaysTopChams;
 };

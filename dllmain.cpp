@@ -1,16 +1,70 @@
 #include <GL/glew.h>
 #include <Windows.h>
+#include <ShlObj.h>
 
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include <thread>
 #include <atomic>
+#include <fstream>
 
 #include <MinHook.h>
+
+#include <chrono>
+#include <string>
+
+#include <filesystem>
+
+std::string BrowseForFolder(const std::string& title) {
+	std::string folderPath;
+	BROWSEINFO bi = { 0 };
+	LPITEMIDLIST pidl;
+
+	bi.ulFlags = BIF_RETURNONLYFSDIRS;
+	bi.lpszTitle = title.c_str();
+
+	pidl = SHBrowseForFolder(&bi);
+
+	if (pidl != NULL) {
+		TCHAR selectedPath[MAX_PATH];
+		if (SHGetPathFromIDList(pidl, selectedPath)) {
+			folderPath = selectedPath;
+		}
+		CoTaskMemFree(pidl);
+	}
+
+	return folderPath;
+}
 
 std::vector<void*> gToUnloadHooks;
 
 std::atomic_bool gbRunning = true;
+
+std::string getCurrentMilliseconds() {
+	std::chrono::milliseconds millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::system_clock::now().time_since_epoch()
+	);
+	return std::to_string(millis.count());
+}
+
+bool WriteFile(const std::string& filePath, const std::string& content) {
+	// Open the file for writing.
+	std::ofstream outputFile(filePath);
+
+	// Check if the file is successfully opened.
+	if (!outputFile.is_open()) {
+		return false; // Return false to indicate failure.
+	}
+
+	// Write the content to the file.
+	outputFile << content;
+
+	// Close the file.
+	outputFile.close();
+
+	return true; // Return true to indicate success.
+}
 
 struct ShaderObject {
 	void AddSource(const char* pSource)
@@ -51,14 +105,65 @@ struct ShaderObject {
 		AddSources(sourcesCnt, sources);
 	}
 
-	std::string getSource()
+	std::string getSource(bool sorted = false) const
 	{
 		std::string result = "";
 
+		if (!sorted)
+		{
+			for (const std::string& source : sources)
+				result += source + "\n";
+
+			return result;
+		}
+
+		std::vector<std::string> sortedSources = sources;
+
+		std::sort(sortedSources.begin(), sortedSources.end());
+
 		for (const std::string& source : sources)
 			result += source + "\n";
+
+		return result;
 	}
 
+	std::string getTypeName() const
+	{
+		switch (type)
+		{
+		case GL_VERTEX_SHADER: return "vs";
+		case GL_FRAGMENT_SHADER: return "fs";
+		case GL_GEOMETRY_SHADER: return "geometry";
+		case GL_COMPUTE_SHADER: return "compute";
+		default: return "unkn";
+		}
+	}
+
+	std::string getFullFileName(const std::string& prefix) const
+	{
+		return prefix + "_" + getTypeName() + ".txt";
+	}
+
+	bool DumpToFile(const std::string& outputPath, const std::string& prefix) const
+	{
+		std::filesystem::path path = outputPath;
+		std::filesystem::path fullOutputPath = path / getFullFileName(prefix);
+		std::string fullOutputPathStr = fullOutputPath.string();
+
+		if (WriteFile(fullOutputPathStr, getSource()) == false)
+			return false;
+
+		printf("Dumped: %s\n", fullOutputPathStr.c_str());
+
+		return true;
+	}
+
+	size_t getHash() const
+	{
+		std::hash<std::string> hashser;
+
+		return hashser(getSource(true));
+	}
 
 	std::vector<std::string> sources;
 	GLuint shader;
@@ -66,13 +171,57 @@ struct ShaderObject {
 };
 
 struct ShaderProgram {
-	std::vector<ShaderObject*> linkedShaders;
+	
+	static std::unordered_set<size_t> dumpedShaders;
+
+	ShaderProgram()
+	{
+		pseudoName = getCurrentMilliseconds();
+	}
+
+	std::unordered_map<GLuint, ShaderObject> linkedShaders;
 	GLuint program;
+	std::string pseudoName;
+
+	size_t getHash() const
+	{
+		std::vector<size_t> hashes;
+		std::hash<std::string> hasher;
+		std::string hashesConcatened = "";
+
+		for (const auto& kv : linkedShaders)
+			hashes.push_back(kv.second.getHash());
+
+		std::sort(hashes.begin(), hashes.end());
+
+		for (size_t hash : hashes)
+			hashesConcatened += std::to_string(hash);
+
+		return hasher(hashesConcatened);
+	}
+
+	bool DumpToFile(const std::string& outPath) const
+	{
+		bool bAnyDumped = false;
+
+		for (const auto& kv : linkedShaders)
+		{
+			const ShaderObject& shaderObj = kv.second;
+
+			if (shaderObj.DumpToFile(outPath, pseudoName) == false)
+				continue;
+
+			bAnyDumped = true;
+		}
+
+		return bAnyDumped;
+	}
 };
 
 struct Shaders {
 	std::unordered_map<GLuint, ShaderObject> shadersObjects;
 	std::unordered_map<GLuint, ShaderProgram> shaders;
+	std::unordered_set<size_t> dumpedShaders;
 
 	bool HasShaderObject(GLuint shaderObj)
 	{
@@ -81,7 +230,40 @@ struct Shaders {
 
 	bool HasShaderProgram(GLuint shaderObj)
 	{
-		return shadersObjects.find(shaderObj) != shadersObjects.end();
+		return shaders.find(shaderObj) != shaders.end();
+	}
+
+	bool DumpAllToFile(const std::string& outputPath)
+	{
+		if (std::filesystem::exists(outputPath) == false)
+		{
+			try {
+				// Define the path to the directory you want to create, including nested folders.
+				std::filesystem::path directoryPath = outputPath;
+
+				// Use fs::create_directories to create the directory and its parent directories if they don't exist.
+				std::filesystem::create_directories(directoryPath);
+			}
+			catch (const std::filesystem::filesystem_error& e) {
+				return false;
+			}
+		}
+
+		for (const std::pair<GLuint, ShaderProgram>& shader : shaders)
+		{
+			const ShaderProgram& shaderProg = shader.second;
+			size_t shaderHash = shaderProg.getHash();
+
+			if (dumpedShaders.find(shaderHash) != dumpedShaders.end())
+				continue;
+
+			if (shaderProg.DumpToFile(outputPath) == false)
+				continue;
+
+			dumpedShaders.insert(shaderHash);
+		}
+
+		return true;
 	}
 };
 
@@ -148,6 +330,10 @@ void hglAttachShader(GLuint program, GLuint shader)
 		printf("Warning: %d program not registered\n", program);
 		return;
 	}
+
+	ShaderProgram& shaderProg = gShaders.shaders[program];
+
+	shaderProg.linkedShaders[shader] = gShaders.shadersObjects[shader];
 }
 
 void* wglSwapBuffers;
@@ -212,7 +398,21 @@ bool Run()
 		// Lets periodicly check 
 		// if we are signaled to unload
 
+		if (GetAsyncKeyState(VK_INSERT) & 1)
+		{
+			std::string dumpFolder = BrowseForFolder("Choose Shaders Dump Folder");
+
+			if (dumpFolder.empty() == false)
+			{
+				printf("Dumping All Shaders to: %s\n", dumpFolder.c_str());
+
+				gShaders.DumpAllToFile(dumpFolder);
+			}
+		}
+
 		Sleep(1000);
+
+		gbRunning = (GetAsyncKeyState(VK_DELETE) & 1) == 0;
 	}
 
 	for (void* toUnload : gToUnloadHooks)

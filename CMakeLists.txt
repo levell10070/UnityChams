@@ -5,7 +5,7 @@ add_library(ShaderDumper SHARED dllmain.cpp  "Texture.cpp" "Vectors.h" )
 
 find_package(OpenGL REQUIRED)
 
-set(CMAKE_CXX_STANDARD 17)
+target_compile_features(ShaderDumper PRIVATE cxx_std_17)
 
 if(MSVC)
 	# For Visual C++

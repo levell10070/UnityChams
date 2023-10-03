@@ -8,179 +8,190 @@
 
 #include <MinHook.h>
 
-#include "Texture.h"
-
-// This part is subject 
-// to change from gram to game
-// if you dont see the chams showing
-// you may try with game specific uniforms names
-
-void (WINAPI* oglDrawElements)(GLenum mode, GLsizei count, GLenum type, const void* indices);
-
-GLuint gTexCyan;
-GLuint gTexRed;
-GLuint gTexYellow;
-GLuint gTexPurple;
-
-std::unordered_map<std::string, ChamsInfo> gChamsDescs{
-	{"_Cutoff"		, {&gTexCyan, &gTexPurple}},	// For Trees.
-	{"_LightColor0"	, {&gTexCyan, &gTexYellow}}		// For Entities
-};
+std::vector<void*> gToUnloadHooks;
 
 std::atomic_bool gbRunning = true;
 
-bool CurrentShaderHasUniform(const std::string& uniform)
-{
-	GLint currProgram;
-	glGetIntegerv(GL_CURRENT_PROGRAM, &currProgram);
-
-	GLint id = -1;
-
-	id = glGetUniformLocation(currProgram, uniform.c_str());
-
-	return id != -1;
-}
-
-void DrawVisible(GLenum mode, GLsizei count, GLenum type, const void* indices, const ChamsInfo& chamsDesc)
-{
-	GLTexture2DBindRestore guard(*(chamsDesc.pVisibleChamsTex));
-
-	oglDrawElements(mode, count, type, indices);
-}
-
-void DrawAlwaysTop(GLenum mode, GLsizei count, GLenum type, const void* indices, const ChamsInfo& chamsDesc)
-{
-	GLTexture2DBindRestore guard(*(chamsDesc.pAlwaysTopChams));
-
-	glDisable(GL_DEPTH_TEST);
-
-	oglDrawElements(mode, count, type, indices);
-
-	glEnable(GL_DEPTH_TEST);
-}
-
-bool ChamsContextInitialize()
-{
-	// At this point, glew started without any problems
-
+struct ShaderObject {
+	void AddSource(const char* pSource)
 	{
-		GLTexture2DBindRestore guard(0);
-
-		ColorToTexture({ 0		,0xFF	,0xFF	,0xFF }, &gTexCyan);
-		ColorToTexture({ 0xFF	,0x0	,0x0	,0xFF }, &gTexRed);
-		ColorToTexture({ 0xFF	,0xFF	,0x0	,0xFF }, &gTexYellow);
-		ColorToTexture({ 0xCF	,0x34	,0x76	,0xFF }, &gTexPurple);
+		sources.push_back(pSource);
 	}
 
-	// At this point, we have the right context, for our chams
-
-	return true;
-}
-
-void ChamsContextShutdown(bool bUnhookElems = true)
-{
-	// To Unhook the glDrawElements func
-	if(bUnhookElems) MH_DisableHook(glDrawElements);
-
-	gbRunning = false;
-}
-
-void WINAPI hglDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-
-	static bool bGlewInitialized = false;
-
-	if (!bGlewInitialized)
+	void AddSources(size_t sourcesCnt, const char** pSources)
 	{
-		// At this point, there is a current app context binded
-		// Meaning we can use it to call glewInit(), all we care 
-		// is for the glProcs
+		for (int i = 0; i < sourcesCnt; i++)
+			AddSource(pSources[i]);
+	}
 
-		if (glewInit() != GLEW_OK)
+	void AddSources(size_t sourcesCnt, const std::vector<std::string>& pSources)
+	{
+		std::vector<const char*> sources;
+
+		for (int i = 0; i < sourcesCnt; i++)
+			sources.push_back(pSources[i].c_str());
+
+		AddSources(sourcesCnt, sources.data());
+	}
+
+	void AddSources(size_t sourcesCnt, const char** pSources, const int* length)
+	{
+		std::vector<std::string> sources;
+
+		bool bUseStrLen = length == nullptr;
+
+		for (int i = 0; i < sourcesCnt; i++)
 		{
-			printf("Failed Initializing Glew\n");
+			const char* currSrc = pSources[i];
+			size_t srcSz = bUseStrLen ? strlen(currSrc) : length[i];
 
-			glDrawElements(mode, count, type, indices);
-
-			ChamsContextShutdown();
-
-			return;
+			sources.emplace_back(currSrc, srcSz);
 		}
 
-		// At this point, Glew initilized Properly
-
-		bGlewInitialized = true;
+		AddSources(sourcesCnt, sources);
 	}
 
-	// At this point, there are, available glProcs
-
-	if ((GetAsyncKeyState(VK_DELETE) & 1) == 1)
+	std::string getSource()
 	{
-		// At this point, user has requested to unload
-		// Lets do this call
-		
-		oglDrawElements(mode, count, type, indices);
+		std::string result = "";
 
-		ChamsContextShutdown();
+		for (const std::string& source : sources)
+			result += source + "\n";
+	}
 
+
+	std::vector<std::string> sources;
+	GLuint shader;
+	GLuint type;
+};
+
+struct ShaderProgram {
+	std::vector<ShaderObject*> linkedShaders;
+	GLuint program;
+};
+
+struct Shaders {
+	std::unordered_map<GLuint, ShaderObject> shadersObjects;
+	std::unordered_map<GLuint, ShaderProgram> shaders;
+
+	bool HasShaderObject(GLuint shaderObj)
+	{
+		return shadersObjects.find(shaderObj) != shadersObjects.end();
+	}
+
+	bool HasShaderProgram(GLuint shaderObj)
+	{
+		return shadersObjects.find(shaderObj) != shadersObjects.end();
+	}
+};
+
+Shaders gShaders;
+
+GLuint(WINAPI* oglCreateShader)(GLenum type);
+GLuint WINAPI hglCreateShader(GLenum type)
+{
+	GLuint shader = oglCreateShader(type);
+
+	if (shader == 0)
+		return shader;
+
+	gShaders.shadersObjects.erase(shader);
+
+	ShaderObject& shaderObj = gShaders.shadersObjects[shader];
+
+	shaderObj.type = type;
+	shaderObj.shader = shader;
+
+	return shader;
+}
+
+void (GLAPIENTRY* oglShaderSource) (GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length);
+void GLAPIENTRY hglShaderSource(GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length)
+{
+	oglShaderSource(shader, count, string, length);
+
+	if (gShaders.HasShaderObject(shader) == false)
+	{
+		printf("Warning: %d shader object not registered\n", shader);
 		return;
 	}
 
-	if (mode != GL_TRIANGLES || count < 900)
+	ShaderObject& shaderObj = gShaders.shadersObjects[shader];
+
+	shaderObj.AddSources(count, (const char**)string, length);
+}
+
+GLuint(GLAPIENTRY* oglCreateProgram) (void);
+GLuint GLAPIENTRY hglCreateProgram (void)
+{
+	GLuint shader = oglCreateProgram();
+
+	if (shader == 0)
+		return shader;
+
+	gShaders.shaders.erase(shader);
+
+	ShaderProgram& shaderProg = gShaders.shaders[shader];
+
+	shaderProg.program = shader;
+
+	return shader;
+}
+
+void (GLAPIENTRY* oglAttachShader)(GLuint program, GLuint shader);
+void hglAttachShader(GLuint program, GLuint shader)
+{
+	oglAttachShader(program, shader);
+
+	if (gShaders.HasShaderProgram(program) == false)
 	{
-		// Seems this draw call is to small 
-		// to be a entity, say like a player
-		// lets ignore it.
-
-		return oglDrawElements(mode, count, type, indices);
-	}
-
-	const std::pair<const std::string, ChamsInfo>* pChamDescKv = nullptr;
-
-	for (const auto& chamDescKv : gChamsDescs)
-	{
-		if (!CurrentShaderHasUniform(chamDescKv.first)) continue;
-
-		// At this point, we found a draw-call that is suitable as a "Chams Target".
-
-		pChamDescKv = &chamDescKv;
-		break;
-	}
-
-	if (pChamDescKv == nullptr)
-	{
-		// Seems we are not interested into, 
-		// tweaking this draw-call, lets pass
-
-		return oglDrawElements(mode, count, type, indices);
-	}
-
-	// At this point, we found the right 
-	// thing we want to tweak on.
-	// now, since we konw the right game context is bound, 
-	// lets deal with chams context initializetion here
-
-	static bool gbChamsCtxInitialized = false;
-
-	if (!gbChamsCtxInitialized &&
-		!(gbChamsCtxInitialized = ChamsContextInitialize()))
-	{
-		// At this point, seems we failed
-		// to initilize Chams Context
-		// Lets simply unhook and signal 
-		// the main thread to unload
-
-		oglDrawElements(mode, count, type, indices);
-
-		ChamsContextShutdown();
-
+		printf("Warning: %d program not registered\n", program);
 		return;
 	}
+}
 
-	// At this point, if first time, being here measn, we was sucessfully to initialize
-	// otherwise, means we alredy initilized, and here we are running!
+void* wglSwapBuffers;
+BOOL (WINAPI* owglSwapBuffers)(HDC hdc);
+BOOL WINAPI hwglSwapBuffers(HDC hdc)
+{
+	BOOL result = owglSwapBuffers(hdc);
 
-	DrawAlwaysTop(mode, count, type, indices, pChamDescKv->second);
-	DrawVisible(mode, count, type, indices, pChamDescKv->second);
+	static bool bInitilized = false;
+
+	if (bInitilized)
+		return result;
+
+	if (glewInit() != GLEW_OK)
+	{
+		printf("Failed Initializing Glew\n");
+
+		MH_DisableHook(wglSwapBuffers);
+
+		gbRunning = false;
+
+		return result;
+	}
+
+	MH_CreateHook(glCreateShader, hglCreateShader, (void**)&oglCreateShader);
+	MH_EnableHook(glCreateShader);
+	gToUnloadHooks.push_back(glCreateShader);
+
+	MH_CreateHook(glShaderSource, hglShaderSource, (void**)&oglShaderSource);
+	MH_EnableHook(glShaderSource);
+	gToUnloadHooks.push_back(glShaderSource);
+
+	MH_CreateHook(glCreateProgram, hglCreateProgram, (void**)&oglCreateProgram);
+	MH_EnableHook(glCreateProgram);
+	gToUnloadHooks.push_back(glCreateProgram);
+
+	MH_CreateHook(glAttachShader, hglAttachShader, (void**)&oglAttachShader);
+	MH_EnableHook(glAttachShader);
+	gToUnloadHooks.push_back(glAttachShader);
+
+	MH_DisableHook(wglSwapBuffers);
+	bInitilized = true;
+
+	return result;
 }
 
 bool Run()
@@ -188,8 +199,13 @@ bool Run()
 	if (MH_Initialize() != MH_OK)
 		return false;
 
-	MH_CreateHook((LPVOID)glDrawElements, hglDrawElements, (LPVOID*)&oglDrawElements);
-	MH_EnableHook(glDrawElements);
+	wglSwapBuffers = (void*)GetProcAddress(GetModuleHandleA("OPENGL32.DLL"), "wglSwapBuffers");
+
+	if (wglSwapBuffers == nullptr)
+		return false;
+
+	MH_CreateHook(wglSwapBuffers, hwglSwapBuffers, (void**)&owglSwapBuffers);
+	MH_EnableHook(wglSwapBuffers);
 
 	while (gbRunning)
 	{
@@ -199,10 +215,8 @@ bool Run()
 		Sleep(1000);
 	}
 
-	// The glDrawElements hook, is spected to unload itself, 
-	// before signaling this thread to finish by setting 
-	// the gbRunning flag, meaning that at this point, 
-	// we are guaranteed to unload
+	for (void* toUnload : gToUnloadHooks)
+		MH_DisableHook(toUnload);
 
 	MH_Uninitialize();
 
